@@ -17,7 +17,7 @@
 
 package org.apache.spark.executor
 
-import java.io.{File}
+import java.io.File
 import java.lang.management.ManagementFactory
 import java.nio.ByteBuffer
 import java.util.concurrent._
@@ -31,7 +31,8 @@ import org.apache.spark.util.Utils
 
 
 /**
- * The Mesos executor for Spark.
+ * The backend executor for Spark. The executor maintains a thread pool and uses it to execute
+ * tasks.
  */
 private[spark] class Executor(
     executorId: String,
@@ -101,18 +102,40 @@ private[spark] class Executor(
   val executorSource = new ExecutorSource(this, executorId)
 
   // Initialize Spark environment (using system properties read above)
-  val env = SparkEnv.createFromSystemProperties(executorId, slaveHostname, 0, false, false)
+  private val env = SparkEnv.createFromSystemProperties(executorId, slaveHostname, 0,
+    isDriver = false, isLocal = false)
   SparkEnv.set(env)
   env.metricsSystem.registerSource(executorSource)
 
-  private val akkaFrameSize = env.actorSystem.settings.config.getBytes("akka.remote.netty.message-frame-size")
+  // Akka's message frame size. This is only used to warn the user when the task result is greater
+  // than this value, in which case Akka will silently drop the task result message.
+  private val akkaFrameSize = {
+    env.actorSystem.settings.config.getBytes("akka.remote.netty.message-frame-size")
+  }
 
   // Start worker thread pool
   val threadPool = new ThreadPoolExecutor(
     1, 128, 600, TimeUnit.SECONDS, new SynchronousQueue[Runnable])
 
+  // Maintains the list of running tasks.
+  private val runningTasks = new ConcurrentHashMap[Long, TaskRunner]
+
   def launchTask(context: ExecutorBackend, taskId: Long, serializedTask: ByteBuffer) {
-    threadPool.execute(new TaskRunner(context, taskId, serializedTask))
+    val tr = new TaskRunner(context, taskId, serializedTask)
+    runningTasks.put(taskId, tr)
+    threadPool.execute(tr)
+  }
+
+  def killTask(taskId: Long) {
+    val tr = runningTasks.get(taskId)
+    if (tr != null) {
+      tr.kill()
+      // We remove the task also in the finally block in TaskRunner.run.
+      // The reason we need to remove it here is because killTask might be called before the task
+      // is even launched, and never reaching that finally block. ConcurrentHashMap's remove is
+      // idempotent.
+      runningTasks.remove(taskId)
+    }
   }
 
   /** Get the Yarn approved local directories. */
@@ -124,14 +147,25 @@ private[spark] class Executor(
       .getOrElse(Option(System.getenv("LOCAL_DIRS"))
       .getOrElse(""))
 
-    if (localDirs.isEmpty()) {
+    if (localDirs.isEmpty) {
       throw new Exception("Yarn Local dirs can't be empty")
     }
-    return localDirs
+    localDirs
   }
 
-  class TaskRunner(context: ExecutorBackend, taskId: Long, serializedTask: ByteBuffer)
+  class TaskRunner(execBackend: ExecutorBackend, taskId: Long, serializedTask: ByteBuffer)
     extends Runnable {
+
+    @volatile private var killed = false
+    @volatile private var task: Task[Any] = _
+
+    def kill() {
+      logInfo("Executor is trying to kill task " + taskId)
+      killed = true
+      if (task != null) {
+        task.kill()
+      }
+    }
 
     override def run() {
       val startTime = System.currentTimeMillis()
@@ -139,47 +173,68 @@ private[spark] class Executor(
       Thread.currentThread.setContextClassLoader(replClassLoader)
       val ser = SparkEnv.get.closureSerializer.newInstance()
       logInfo("Running task ID " + taskId)
-      context.statusUpdate(taskId, TaskState.RUNNING, EMPTY_BYTE_BUFFER)
+      execBackend.statusUpdate(taskId, TaskState.RUNNING, EMPTY_BYTE_BUFFER)
       var attemptedTask: Option[Task[Any]] = None
       var taskStart: Long = 0
-      def getTotalGCTime = ManagementFactory.getGarbageCollectorMXBeans.map(g => g.getCollectionTime).sum
-      val startGCTime = getTotalGCTime
+      def gcTime = ManagementFactory.getGarbageCollectorMXBeans.map(_.getCollectionTime).sum
+      val startGCTime = gcTime
 
       try {
         SparkEnv.set(env)
         Accumulators.clear()
         val (taskFiles, taskJars, taskBytes) = Task.deserializeWithDependencies(serializedTask)
         updateDependencies(taskFiles, taskJars)
-        val task = ser.deserialize[Task[Any]](taskBytes, Thread.currentThread.getContextClassLoader)
+        task = ser.deserialize[Task[Any]](taskBytes, Thread.currentThread.getContextClassLoader)
+
+        // If this task has been killed before we deserialized it, let's quit now. Otherwise,
+        // continue executing the task.
+        if (killed) {
+          logInfo("Executor killed task " + taskId)
+          execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
+        }
+
         attemptedTask = Some(task)
-        logInfo("Its epoch is " + task.epoch)
+        logDebug("Its epoch is " + task.epoch)
         env.mapOutputTracker.updateEpoch(task.epoch)
+
+        // Run the actual task and measure its runtime.
         taskStart = System.currentTimeMillis()
         val value = task.run(taskId.toInt)
         val taskFinish = System.currentTimeMillis()
+
+        // If the task has been killed, let's fail it.
+        if (task.killed) {
+          logInfo("Executor killed task " + taskId)
+          execBackend.statusUpdate(taskId, TaskState.KILLED, ser.serialize(TaskKilled))
+        }
+
         for (m <- task.metrics) {
-          m.hostname = Utils.localHostName
+          m.hostname = Utils.localHostName()
           m.executorDeserializeTime = (taskStart - startTime).toInt
           m.executorRunTime = (taskFinish - taskStart).toInt
-          m.jvmGCTime = getTotalGCTime - startGCTime
+          m.jvmGCTime = gcTime - startGCTime
         }
-        //TODO I'd also like to track the time it takes to serialize the task results, but that is huge headache, b/c
-        // we need to serialize the task metrics first.  If TaskMetrics had a custom serialized format, we could
-        // just change the relevants bytes in the byte buffer
+        // TODO I'd also like to track the time it takes to serialize the task results, but that is
+        // huge headache, b/c we need to serialize the task metrics first.  If TaskMetrics had a
+        // custom serialized format, we could just change the relevants bytes in the byte buffer
         val accumUpdates = Accumulators.values
         val result = new TaskResult(value, accumUpdates, task.metrics.getOrElse(null))
         val serializedResult = ser.serialize(result)
         logInfo("Serialized size of result for " + taskId + " is " + serializedResult.limit)
+
+        // If the task result is too big, it can exceed Akka's message frame and Akka will silently
+        // drop this message. Let's warn the user explicitly by failing the task instead.
         if (serializedResult.limit >= (akkaFrameSize - 1024)) {
-          context.statusUpdate(taskId, TaskState.FAILED, ser.serialize(TaskResultTooBigFailure()))
+          execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(TaskResultTooBigFailure))
           return
         }
-        context.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
+
+        execBackend.statusUpdate(taskId, TaskState.FINISHED, serializedResult)
         logInfo("Finished task ID " + taskId)
       } catch {
         case ffe: FetchFailedException => {
           val reason = ffe.toTaskEndReason
-          context.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
+          execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
         }
 
         case t: Throwable => {
@@ -187,10 +242,10 @@ private[spark] class Executor(
           val metrics = attemptedTask.flatMap(t => t.metrics)
           for (m <- metrics) {
             m.executorRunTime = serviceTime
-            m.jvmGCTime = getTotalGCTime - startGCTime
+            m.jvmGCTime = gcTime - startGCTime
           }
           val reason = ExceptionFailure(t.getClass.getName, t.toString, t.getStackTrace, metrics)
-          context.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
+          execBackend.statusUpdate(taskId, TaskState.FAILED, ser.serialize(reason))
 
           // TODO: Should we exit the whole executor here? On the one hand, the failed task may
           // have left some weird state around depending on when the exception was thrown, but on
@@ -198,6 +253,8 @@ private[spark] class Executor(
           logError("Exception in task ID " + taskId, t)
           //System.exit(1)
         }
+      } finally {
+        runningTasks.remove(taskId)
       }
     }
   }
@@ -207,7 +264,7 @@ private[spark] class Executor(
    * created by the interpreter to the search path
    */
   private def createClassLoader(): ExecutorURLClassLoader = {
-    var loader = this.getClass.getClassLoader
+    val loader = this.getClass.getClassLoader
 
     // For each of the jars in the jarSet, add them to the class loader.
     // We assume each of the files has already been fetched.
@@ -229,7 +286,7 @@ private[spark] class Executor(
         val klass = Class.forName("org.apache.spark.repl.ExecutorClassLoader")
           .asInstanceOf[Class[_ <: ClassLoader]]
         val constructor = klass.getConstructor(classOf[String], classOf[ClassLoader])
-        return constructor.newInstance(classUri, parent)
+        constructor.newInstance(classUri, parent)
       } catch {
         case _: ClassNotFoundException =>
           logError("Could not find org.apache.spark.repl.ExecutorClassLoader on classpath!")
@@ -237,7 +294,7 @@ private[spark] class Executor(
           null
       }
     } else {
-      return parent
+      parent
     }
   }
 

@@ -18,6 +18,7 @@
 package org.apache.spark.rdd
 
 import java.util.Random
+import java.util.concurrent.Future
 
 import scala.collection.Map
 import scala.collection.JavaConversions.mapAsScalaMap
@@ -562,6 +563,15 @@ abstract class RDD[T: ClassManifest](
   }
 
   /**
+   * Return a future for retrieving the results of a collect in an asynchronous fashion.
+   */
+  def collectAsync(): Future[Seq[T]] = {
+    val results = new ArrayBuffer[T]
+    sc.submitJob[T, Array[T], Seq[T]](
+      this, _.toArray, Range(0, partitions.size), (index, data) => results ++= data, () => results)
+  }
+
+  /**
    * Return an array that contains all of the elements in this RDD.
    */
   def toArray(): Array[T] = collect()
@@ -841,6 +851,11 @@ abstract class RDD[T: ClassManifest](
   def keyBy[K](f: T => K): RDD[(K, T)] = {
     map(x => (f(x), x))
   }
+
+  /**
+   * Creates an interruptible version of this RDD.
+   */
+  def interruptible(): RDD[T] = new InterruptibleRDD(this)
 
   /** A private method for tests, to look at the contents of each partition */
   private[spark] def collectPartitions(): Array[Array[T]] = {

@@ -20,6 +20,7 @@ package org.apache.spark
 import java.io._
 import java.net.URI
 import java.util.Properties
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.Map
@@ -810,6 +811,38 @@ class SparkContext(
       localProperties.get)
     logInfo("Job finished: " + callSite + ", took " + (System.nanoTime - start) / 1e9 + " s")
     result
+  }
+
+  def submitJob[T, U, R](
+      rdd: RDD[T],
+      processPartition: Iterator[T] => U,
+      partitions: Seq[Int],
+      partitionResultHandler: (Int, U) => Unit,
+      resultFunc: () => R): Future[R] =
+  {
+    val callSite = Utils.formatSparkCallSite
+    val waiter = dagScheduler.submitJob(
+      rdd,
+      (context: TaskContext, iter: Iterator[T]) => processPartition(iter),
+      partitions,
+      callSite,
+      allowLocal = false,
+      partitionResultHandler,
+      null)
+    new FutureJob(waiter, resultFunc)
+  }
+
+  /**
+   * Kill a running job.
+   */
+  def killJob(jobId: Int) {
+    dagScheduler.killJob(jobId)
+  }
+
+  def killAllJobs() {
+    dagScheduler.activeJobs.foreach { job =>
+      killJob(job.jobId)
+    }
   }
 
   /**

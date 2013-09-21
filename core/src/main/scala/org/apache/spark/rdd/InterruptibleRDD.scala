@@ -15,25 +15,22 @@
  * limitations under the License.
  */
 
-package org.apache.spark.scheduler
+package org.apache.spark.rdd
 
-import java.util.Properties
+import org.apache.spark.{InterruptibleIterator, Partition, TaskContext}
+
 
 /**
- * A set of tasks submitted together to the low-level TaskScheduler, usually representing
- * missing partitions of a particular stage.
+ * Wraps around an existing RDD to make it interruptible (can be killed).
  */
-private[spark] class TaskSet(
-    val tasks: Array[Task[_]],
-    val stageId: Int,
-    val attempt: Int,
-    val priority: Int,
-    val properties: Properties) {
-    val id: String = stageId + "." + attempt
+private[spark]
+class InterruptibleRDD[T: ClassManifest](prev: RDD[T]) extends RDD[T](prev) {
 
-  def kill() {
-    tasks.foreach(_.kill())
+  override def getPartitions: Array[Partition] = firstParent[T].partitions
+
+  override val partitioner = prev.partitioner
+
+  override def compute(split: Partition, context: TaskContext) = {
+    new InterruptibleIterator(context, firstParent[T].iterator(split, context))
   }
-
-  override def toString: String = "TaskSet " + id
 }

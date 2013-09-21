@@ -17,27 +17,34 @@
 
 package org.apache.spark
 
-import executor.TaskMetrics
-import scala.collection.mutable.ArrayBuffer
+import java.util.concurrent.{ExecutionException, TimeUnit, Future}
 
-class TaskContext(
-  val stageId: Int,
-  val splitId: Int,
-  val attemptId: Long,
-  val runningLocally: Boolean = false,
-  @volatile var interrupted: Boolean = false,
-  val taskMetrics: TaskMetrics = TaskMetrics.empty()
-) extends Serializable {
+import org.apache.spark.scheduler.{JobFailed, JobSucceeded, JobWaiter}
 
-  @transient val onCompleteCallbacks = new ArrayBuffer[() => Unit]
+class FutureJob[T] private[spark](jobWaiter: JobWaiter[_], resultFunc: () => T)
+  extends Future[T] {
 
-  // Add a callback function to be executed on task completion. An example use
-  // is for HadoopRDD to register a callback to close the input stream.
-  def addOnCompleteCallback(f: () => Unit) {
-    onCompleteCallbacks += f
+  override def isDone: Boolean = jobWaiter.jobFinished
+
+  override def cancel(mayInterruptIfRunning: Boolean): Boolean = {
+    jobWaiter.kill()
+    true
   }
 
-  def executeOnCompleteCallbacks() {
-    onCompleteCallbacks.foreach{_()}
+  override def isCancelled: Boolean = {
+    throw new UnsupportedOperationException
+  }
+
+  override def get(): T = {
+    jobWaiter.awaitResult() match {
+      case JobSucceeded =>
+        resultFunc()
+      case JobFailed(e: Exception, _) =>
+        throw new ExecutionException(e)
+    }
+  }
+
+  override def get(timeout: Long, unit: TimeUnit): T = {
+    throw new UnsupportedOperationException
   }
 }
